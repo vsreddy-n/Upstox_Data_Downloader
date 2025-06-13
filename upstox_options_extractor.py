@@ -1,0 +1,619 @@
+import pandas as pd
+import json
+import os
+import time
+from datetime import datetime, timedelta
+
+# Safe optimization: HTTPx for faster HTTP with connection pooling
+try:
+    import httpx
+    HTTPX_AVAILABLE = True
+    print("✅ HTTPx available - using optimized HTTP client with connection pooling")
+except ImportError:
+    import requests
+    HTTPX_AVAILABLE = False
+    print("⚠️  HTTPx not available, falling back to requests")
+
+# Install flowguard if not available: pip install flowguard
+try:
+    from flowguard import RateLimiter
+    FLOWGUARD_AVAILABLE = True
+except ImportError:
+    print("⚠️  flowguard not installed. Install with: pip install flowguard")
+    print("   Falling back to basic rate limiting...")
+    FLOWGUARD_AVAILABLE = False
+
+# ================================
+# USER CONFIGURATION
+# ================================
+USER_START_DATE = "2024-12-20"     # User provides this
+USER_END_DATE = "2024-12-31"       # User provides this
+TIMEFRAME = "5minute"              # User configurable: 1minute, 5minute, 15minute, 1day, etc.
+
+# Index Selection - User Input
+INDEX_TYPE = "NIFTY_50"            # User selects: NIFTY_50, BANK_NIFTY, SENSEX, etc.
+
+# Index Mapping
+INDEX_MAPPING = {
+    "NIFTY_50": "NSE_INDEX|Nifty 50",
+    "BANK_NIFTY": "NSE_INDEX|Nifty Bank", 
+    "SENSEX": "BSE_INDEX|SENSEX",
+    "NIFTY_IT": "NSE_INDEX|Nifty IT",
+    "NIFTY_PHARMA": "NSE_INDEX|Nifty Pharma",
+}
+
+# Get the actual instrument key
+INSTRUMENT_KEY = INDEX_MAPPING[INDEX_TYPE]
+
+# ================================
+# MULTIPLE ACCESS TOKENS
+# ================================
+# Import centralized token configuration
+from upstox_tokens import get_multi_tokens, get_headers
+
+# Get multiple tokens from centralized config
+ACCESS_TOKENS = get_multi_tokens()
+
+# Token rotation state
+current_token_index = 0
+token_request_counts = [0] * len(ACCESS_TOKENS)  # Track requests per token
+token_start_times = [time.time()] * len(ACCESS_TOKENS)  # Track 30-min windows
+
+def get_current_token():
+    """Get current active token and rotate if needed"""
+    global current_token_index
+    return ACCESS_TOKENS[current_token_index]
+
+def rotate_token():
+    """Rotate to next available token"""
+    global current_token_index
+    
+    if len(ACCESS_TOKENS) == 1:
+        return  # No rotation possible with single token
+    
+    # Find next token that hasn't hit rate limit
+    for i in range(len(ACCESS_TOKENS)):
+        next_index = (current_token_index + 1 + i) % len(ACCESS_TOKENS)
+        
+        # Check if this token's 30-minute window has reset
+        time_elapsed = time.time() - token_start_times[next_index]
+        if time_elapsed >= 1800:  # 30 minutes = 1800 seconds
+            # Reset this token's counters
+            token_request_counts[next_index] = 0
+            token_start_times[next_index] = time.time()
+            current_token_index = next_index
+            print(f"🔄 Rotated to token #{next_index + 1} (window reset)")
+            return
+        
+        # Check if this token has capacity
+        if token_request_counts[next_index] < 1800:  # Stay under 2000 limit
+            current_token_index = next_index
+            print(f"🔄 Rotated to token #{next_index + 1} ({token_request_counts[next_index]}/1800 requests used)")
+            return
+    
+    # All tokens are at limit - wait for oldest to reset
+    oldest_token = min(range(len(ACCESS_TOKENS)), key=lambda i: token_start_times[i])
+    wait_time = 1800 - (time.time() - token_start_times[oldest_token])
+    if wait_time > 0:
+        print(f"⏳ All tokens at limit. Waiting {wait_time:.0f}s for token #{oldest_token + 1} to reset...")
+        time.sleep(wait_time)
+        token_request_counts[oldest_token] = 0
+        token_start_times[oldest_token] = time.time()
+        current_token_index = oldest_token
+
+def track_request():
+    """Track request for current token and rotate if needed"""
+    global current_token_index
+    
+    # Increment request count for current token
+    token_request_counts[current_token_index] += 1
+    
+    # Check if current token is approaching limit
+    if token_request_counts[current_token_index] >= 1800:  # 90% of 2000 limit
+        print(f"⚠️  Token #{current_token_index + 1} approaching limit ({token_request_counts[current_token_index]}/2000)")
+        rotate_token()
+
+# ================================
+# RATE LIMITING SETUP
+# ================================
+if FLOWGUARD_AVAILABLE:
+    # Upstox limits: 50 req/sec, 500 req/min, 2000 req/30min
+    # VERY Conservative settings to avoid 429 errors: 15 req/sec, 200 req/min
+    rate_limiter = RateLimiter(sec=15, min=200, max_burst=3)
+    print("✅ Using flowguard rate limiter (15 req/sec, 200 req/min)")
+else:
+    rate_limiter = None
+    print("⚠️  Using basic rate limiting (100ms delays)")
+
+# ================================
+# UTILITY FUNCTIONS
+# ================================
+
+def get_current_headers():
+    """Get headers with current active token"""
+    return {
+        'accept': 'application/json',
+        'Authorization': f'Bearer {get_current_token()}'
+    }
+
+# Global HTTP client for connection pooling (optimization #2)
+http_client = None
+
+def get_http_client():
+    """Get or create HTTP client with connection pooling"""
+    global http_client
+    if http_client is None:
+        if HTTPX_AVAILABLE:
+            # HTTPx with connection pooling for better performance
+            http_client = httpx.Client(
+                timeout=30.0,
+                limits=httpx.Limits(max_connections=1, max_keepalive_connections=1)
+            )
+        else:
+            # Requests session for connection pooling
+            import requests
+            http_client = requests.Session()
+    return http_client
+
+def make_request(method, url, headers=None, params=None, data=None):
+    """Optimized HTTP request with connection pooling"""
+    try:
+        client = get_http_client()
+        
+        if method == 'GET':
+            response = client.get(url, headers=headers, params=params)
+        elif method == 'POST':
+            response = client.post(url, headers=headers, params=params, json=data)
+        elif method == 'PUT':
+            response = client.put(url, headers=headers, params=params, json=data)
+        else:
+            raise ValueError('Invalid HTTP method.')
+        
+        if response.status_code == 200:
+            return response.json()
+        else:
+            print(f"Error: {response.status_code} - {response.text}")
+            return response
+            
+    except Exception as e:
+        print(f'An error occurred: {e}')
+        return None
+
+def filter_expiry_dates(expiry_dates, start_date, end_date):
+    """Filter expiry dates within user specified range"""
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    
+    filtered_dates = []
+    for date_str in expiry_dates:
+        date_dt = datetime.strptime(date_str, "%Y-%m-%d")
+        if start_dt <= date_dt <= end_dt:
+            filtered_dates.append(date_str)
+    
+    return filtered_dates
+
+def calculate_data_range(expiry_date, previous_expiry=None, user_start_date=None):
+    """Calculate start and end dates for historical data collection"""
+    end_date = expiry_date
+    
+    if previous_expiry is None:
+        # First expiry - use user start date
+        start_date = user_start_date or USER_START_DATE
+    else:
+        # Calculate next day after previous expiry
+        prev_dt = datetime.strptime(previous_expiry, "%Y-%m-%d")
+        start_dt = prev_dt + timedelta(days=1)
+        start_date = start_dt.strftime("%Y-%m-%d")
+    
+    return start_date, end_date
+
+def create_filename(file_type):
+    """Create standardized filename"""
+    base_name = f"{INDEX_TYPE}_{TIMEFRAME}_{USER_START_DATE}_{USER_END_DATE}"
+
+    if file_type == "expiry":
+        return f"{base_name}_expiry_dates.json"
+    elif file_type == "instruments":
+        return f"{base_name}_instrument_keys.json"
+    elif file_type == "historical":
+        return f"{base_name}_historical_data.csv"
+
+    return base_name
+
+def create_symbol(base_symbol, expiry_date, strike_price, option_type):
+    """Optimized symbol creation (optimization #3)"""
+    try:
+        # Parse expiry date: "2025-01-16"
+        date_obj = datetime.strptime(expiry_date, "%Y-%m-%d")
+
+        # Optimized string formatting
+        day = date_obj.strftime("%d")           # "16"
+        month = date_obj.strftime("%b").upper() # "JAN"
+        year = date_obj.strftime("%Y")          # "2025"
+
+        # Format: NIFTY16JAN202523000CE
+        symbol = f"{base_symbol}{day}{month}{year}{int(strike_price)}{option_type}"
+        return symbol
+    except Exception as e:
+        print(f"Error creating symbol: {e}")
+        return f"{base_symbol}_{strike_price}_{option_type}"
+
+def make_request_with_token_rotation(method, url, params=None, data=None):
+    """Make request with automatic token rotation on rate limits"""
+    max_retries = len(ACCESS_TOKENS) + 1  # Try all tokens plus one retry
+
+    for attempt in range(max_retries):
+        # Track request for current token
+        track_request()
+
+        # Get current headers with active token
+        headers = get_current_headers()
+
+        # Add delay to respect rate limits
+        time.sleep(0.6)  # 600ms delay = ~1.6 req/sec per token
+
+        response = make_request(method, url, headers=headers, params=params, data=data)
+
+        if response and (isinstance(response, dict) and response.get('status') == 'success'):
+            return response
+        elif hasattr(response, 'status_code') and response.status_code == 429:
+            print(f"    Token #{current_token_index + 1} hit rate limit, rotating...")
+            rotate_token()
+            continue
+        else:
+            print(f"    Request failed for {url}")
+            return None
+
+    print(f"    All tokens exhausted for {url}")
+    return None
+
+def save_historical_data(all_data):
+    """Save historical data to single CSV file in data folder"""
+    if not all_data:
+        return None
+
+    # Create DataFrame and save to main data directory
+    df = pd.DataFrame(all_data)
+    filename = create_filename("historical")
+    df.to_csv(filename, index=False)
+
+    print(f"📁 Saved {len(all_data)} records to: {filename}")
+    return filename
+
+# ================================
+# MAIN FUNCTIONS
+# ================================
+
+def get_expiry_dates():
+    """Step 1: Get and filter expiry dates"""
+    print("Step 1: Fetching expiry dates...")
+
+    url = "https://api.upstox.com/v2/expired-instruments/expiries"
+    params = {
+        'instrument_key': INSTRUMENT_KEY
+    }
+
+    response = make_request_with_token_rotation('GET', url, params=params)
+
+    if response and response.get('status') == 'success':
+        all_expiry_dates = response['data']
+
+        # Filter dates within user range
+        filtered_dates = filter_expiry_dates(all_expiry_dates, USER_START_DATE, USER_END_DATE)
+
+        # Save to JSON
+        filename = create_filename("expiry")
+        with open(filename, 'w') as f:
+            json.dump(filtered_dates, f, indent=2)
+
+        print(f"✓ Found {len(filtered_dates)} expiry dates within range")
+        print(f"✓ Saved to: {filename}")
+
+        return filtered_dates
+    else:
+        print("✗ Failed to fetch expiry dates")
+        return []
+
+def fetch_contracts_for_expiry(expiry_date):
+    """Fetch contracts for a single expiry date with token rotation"""
+    print(f"  Processing expiry: {expiry_date}")
+
+    url = "https://api.upstox.com/v2/expired-instruments/option/contract"
+    params = {
+        'instrument_key': INSTRUMENT_KEY,
+        'expiry_date': expiry_date
+    }
+
+    response = make_request_with_token_rotation('GET', url, params=params)
+
+    if response and response.get('status') == 'success':
+        contracts = response['data']
+        instrument_keys = [contract['instrument_key'] for contract in contracts]
+
+        # Store contract details for later use
+        contract_details = {}
+        for contract in contracts:
+            contract_details[contract['instrument_key']] = {
+                'symbol': contract['underlying_symbol'],
+                'strike_price': contract['strike_price'],
+                'option_type': contract['instrument_type'],
+                'expiry_date': contract['expiry']
+            }
+
+        print(f"    ✓ Found {len(instrument_keys)} instruments for {expiry_date}")
+        return expiry_date, instrument_keys, contract_details
+    else:
+        print(f"    ✗ Failed to fetch instruments for {expiry_date}")
+        return expiry_date, [], {}
+
+def get_instrument_keys(expiry_dates):
+    """Step 2: Get instrument keys for each expiry date with token rotation"""
+    print("\nStep 2: Fetching instrument keys...")
+
+    instrument_data = {}
+    contract_details = {}
+
+    # Process each expiry date sequentially
+    for expiry_date in expiry_dates:
+        expiry_date, instrument_keys, expiry_contract_details = fetch_contracts_for_expiry(expiry_date)
+        instrument_data[expiry_date] = instrument_keys
+        contract_details.update(expiry_contract_details)
+
+    # Save to JSON
+    filename = create_filename("instruments")
+    with open(filename, 'w') as f:
+        json.dump(instrument_data, f, indent=2)
+
+    print(f"✓ Saved instrument keys to: {filename}")
+    return instrument_data, contract_details
+
+def fetch_historical_data_for_instrument(instrument_key, start_date, end_date, contract_details):
+    """Fetch historical data for a single instrument with token rotation"""
+    url = f"https://api.upstox.com/v2/expired-instruments/historical-candle/{instrument_key}/{TIMEFRAME}/{end_date}/{start_date}"
+
+    response = make_request_with_token_rotation('GET', url)
+
+    if response and response.get('status') == 'success':
+        candle_data = response['data']['candles']
+
+        # Get contract details for this instrument
+        contract_info = contract_details.get(instrument_key, {})
+        base_symbol = contract_info.get('symbol', 'UNKNOWN')
+        strike_price = contract_info.get('strike_price', 0)
+        option_type = contract_info.get('option_type', 'UNKNOWN')
+        expiry_date_formatted = contract_info.get('expiry_date', end_date)
+
+        # Create the formatted symbol: NIFTYDDMMMYYYYSTRIKEPRICEOPTIONTYPE
+        formatted_symbol = create_symbol(base_symbol, expiry_date_formatted, strike_price, option_type)
+
+        processed_data = []
+
+        # Process each candle
+        for candle in candle_data:
+            # Parse timestamp to get date and time
+            timestamp_str = candle[0]
+            try:
+                # Parse the timestamp (format: 2025-01-16T15:25:00+05:30)
+                dt = datetime.strptime(timestamp_str.split('+')[0], "%Y-%m-%dT%H:%M:%S")
+                date_part = dt.strftime("%Y-%m-%d")
+                time_part = dt.strftime("%H:%M:%S")
+            except:
+                # Fallback if parsing fails
+                date_part = timestamp_str.split('T')[0] if 'T' in timestamp_str else timestamp_str[:10]
+                time_part = timestamp_str.split('T')[1][:8] if 'T' in timestamp_str else "00:00:00"
+
+            row = {
+                'symbol': formatted_symbol,
+                'date': date_part,
+                'time': time_part,
+                'strikeprice': strike_price,
+                'expirydate': expiry_date_formatted,
+                'option_type': option_type,
+                'open': candle[1],
+                'high': candle[2],
+                'low': candle[3],
+                'close': candle[4],
+                'opt_vol': candle[5],
+                'opt_oi': candle[6] if len(candle) > 6 else None
+            }
+            processed_data.append(row)
+
+        return instrument_key, processed_data, len(candle_data)
+    else:
+        return instrument_key, [], 0
+
+def get_historical_data(instrument_data, contract_details, expiry_dates):
+    """Step 3: Get historical candle data for all instruments with token rotation"""
+    print("\nStep 3: Fetching historical data...")
+
+    all_historical_data = []
+    date_ranges = []  # Store date ranges for terminal output
+    expiry_status = {}  # Track success/failure per expiry
+
+    for i, expiry_date in enumerate(expiry_dates):
+        # Calculate data range for this expiry
+        previous_expiry = expiry_dates[i-1] if i > 0 else None
+        start_date, end_date = calculate_data_range(
+            expiry_date,
+            previous_expiry,
+            USER_START_DATE
+        )
+
+        date_ranges.append(f"{expiry_date}: {start_date} to {end_date}")
+        print(f"  Expiry: {expiry_date} | Data range: {start_date} to {end_date}")
+
+        instruments = instrument_data.get(expiry_date, [])
+
+        if not instruments:
+            expiry_status[expiry_date] = {'status': 'failed', 'reason': 'No instruments found', 'processed': 0, 'total': 0}
+            continue
+
+        print(f"    Processing {len(instruments)} instruments with token rotation...")
+
+        # Track success for this expiry
+        successful_instruments = 0
+        total_records_for_expiry = 0
+
+        # Process each instrument sequentially with token rotation
+        for i, instrument_key in enumerate(instruments, 1):
+            print(f"      Processing {i}/{len(instruments)}: {instrument_key} [Token #{current_token_index + 1}]")
+
+            instrument_key, processed_data, candle_count = fetch_historical_data_for_instrument(
+                instrument_key, start_date, end_date, contract_details
+            )
+
+            if processed_data:
+                all_historical_data.extend(processed_data)
+                successful_instruments += 1
+                total_records_for_expiry += candle_count
+                print(f"      ✓ {instrument_key}: Added {candle_count} candles")
+            else:
+                print(f"      ✗ {instrument_key}: Failed to fetch data")
+
+        # Determine status for this expiry
+        if successful_instruments == 0:
+            expiry_status[expiry_date] = {'status': 'failed', 'reason': 'All instruments failed', 'processed': 0, 'total': len(instruments)}
+        elif successful_instruments < len(instruments):
+            expiry_status[expiry_date] = {'status': 'partial', 'reason': f'{successful_instruments}/{len(instruments)} instruments', 'processed': successful_instruments, 'total': len(instruments)}
+        else:
+            expiry_status[expiry_date] = {'status': 'success', 'reason': f'All {len(instruments)} instruments', 'processed': successful_instruments, 'total': len(instruments)}
+
+    # Save historical data to single CSV file
+    if all_historical_data:
+        print(f"\n📁 Saving {len(all_historical_data)} records to CSV...")
+        saved_file = save_historical_data(all_historical_data)
+
+        return all_historical_data, date_ranges, expiry_status, saved_file
+    else:
+        print("✗ No historical data collected")
+        return [], date_ranges, expiry_status, None
+
+# ================================
+# MAIN EXECUTION
+# ================================
+
+def print_status_summary(expiry_status, date_ranges, saved_file):
+    """Print final status summary with icons"""
+    print("\n📅 DATE RANGES RETRIEVED:")
+
+    for date_range in date_ranges:
+        expiry_date = date_range.split(':')[0]
+        status_info = expiry_status.get(expiry_date, {})
+        status = status_info.get('status', 'unknown')
+        reason = status_info.get('reason', 'Unknown')
+        processed = status_info.get('processed', 0)
+        total = status_info.get('total', 0)
+
+        if status == 'success':
+            icon = "✅"
+            details = f"({processed} instruments, complete)"
+        elif status == 'partial':
+            icon = "⚠️ "
+            details = f"({processed}/{total} instruments, partial)"
+        elif status == 'failed':
+            icon = "❌"
+            details = f"({reason})"
+        else:
+            icon = "❓"
+            details = f"(Unknown status)"
+
+        print(f"   {icon} {date_range} {details}")
+
+    # Summary statistics
+    success_count = sum(1 for status in expiry_status.values() if status.get('status') == 'success')
+    partial_count = sum(1 for status in expiry_status.values() if status.get('status') == 'partial')
+    failed_count = sum(1 for status in expiry_status.values() if status.get('status') == 'failed')
+
+    print(f"\n📊 SUMMARY:")
+    print(f"   ✅ Successful: {success_count} expiry dates")
+    if partial_count > 0:
+        print(f"   ⚠️  Partial: {partial_count} expiry dates")
+    if failed_count > 0:
+        print(f"   ❌ Failed: {failed_count} expiry dates")
+
+    # Show saved file
+    if saved_file:
+        print(f"\n📁 FILE SAVED:")
+        print(f"   📄 {saved_file}")
+
+def print_token_summary():
+    """Print token usage summary"""
+    print(f"\n🔑 TOKEN USAGE SUMMARY:")
+    for i, count in enumerate(token_request_counts):
+        percentage = (count / 2000) * 100
+        print(f"   Token #{i + 1}: {count}/2000 requests ({percentage:.1f}%)")
+
+def main():
+    """Multi-token data extraction with automatic rotation"""
+    start_time = time.time()
+
+    print("=" * 60)
+    print("UPSTOX DATA EXTRACTOR (MULTI-TOKEN)")
+    print("=" * 60)
+    print(f"Index: {INDEX_TYPE}")
+    print(f"Timeframe: {TIMEFRAME}")
+    print(f"Date Range: {USER_START_DATE} to {USER_END_DATE}")
+    print(f"Tokens Available: {len(ACCESS_TOKENS)}")
+    print(f"Effective Rate Limit: {len(ACCESS_TOKENS) * 1800} req/30min")
+
+    # Show active safe optimizations
+    optimizations = []
+    if HTTPX_AVAILABLE:
+        optimizations.append("HTTPx + Connection Pooling")
+    optimizations.append("Optimized Data Processing")
+    optimizations.append("Automatic Token Rotation")
+
+    print(f"Optimizations: {', '.join(optimizations)}")
+    print("Processing: Sequential with Token Rotation (600ms delays per token)")
+    print("=" * 60)
+
+    # Create data directory if it doesn't exist
+    os.makedirs("data", exist_ok=True)
+    os.chdir("data")
+
+    # Step 1: Get expiry dates (JSON saved in main data directory)
+    expiry_dates = get_expiry_dates()
+
+    if not expiry_dates:
+        print("No expiry dates found. Exiting...")
+        return
+
+    # Step 2: Get instrument keys (JSON saved in main data directory)
+    instrument_data, contract_details = get_instrument_keys(expiry_dates)
+
+    # Step 3: Get historical data (CSV files saved)
+    all_data, date_ranges, expiry_status, saved_files = get_historical_data(instrument_data, contract_details, expiry_dates)
+
+    print("\n" + "=" * 60)
+    print("EXTRACTION COMPLETE!")
+    print("=" * 60)
+    print(f"✓ Processed {len(expiry_dates)} expiry dates")
+    print(f"✓ Total instruments: {sum(len(instruments) for instruments in instrument_data.values())}")
+    print(f"✓ Total historical records: {len(all_data)}")
+
+    # Print detailed status summary
+    print_status_summary(expiry_status, date_ranges, saved_files)
+
+    # Print token usage summary
+    print_token_summary()
+
+    # Calculate and display execution time
+    end_time = time.time()
+    execution_time = end_time - start_time
+    execution_minutes = execution_time / 60
+
+    print(f"\n⏱️  EXECUTION TIME:")
+    print(f"   Total time: {execution_time:.2f} seconds ({execution_minutes:.2f} minutes)")
+    print(f"   Performance: {len(all_data)} records in {execution_minutes:.2f} minutes")
+
+    print("=" * 60)
+
+    # Cleanup HTTP client
+    if http_client:
+        try:
+            http_client.close()
+        except:
+            pass
+
+if __name__ == "__main__":
+    main()

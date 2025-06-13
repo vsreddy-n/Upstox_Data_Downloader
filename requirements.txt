@@ -1,0 +1,6 @@
+pandas
+requests
+flowguard
+# 100% Safe performance optimizations (zero data loss risk)
+httpx>=0.24.0
+loguru>=0.7.0
