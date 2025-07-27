@@ -94,7 +94,7 @@ def fetch_historical_data(instrument_key, from_date, to_date):
     # print(f"🔍 DEBUG: Using v3 API: {url}")
 
     # Add delay to respect rate limits
-    time.sleep(1.0)
+    time.sleep(0.1)  # Reduced from 1.0s to 0.1s for better performance
 
     response = make_request(url, params)
     

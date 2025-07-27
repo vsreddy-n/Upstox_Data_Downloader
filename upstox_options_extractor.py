@@ -250,18 +250,17 @@ def make_request_with_token_rotation(method, url, params=None, data=None):
         headers = get_current_headers()
 
         # Add delay to respect rate limits
-        time.sleep(0.6)  # 600ms delay = ~1.6 req/sec per token
+        time.sleep(0.2)  # Reduced from 0.6s to 0.2s for better performance
 
         response = make_request(method, url, headers=headers, params=params, data=data)
 
         if response and (isinstance(response, dict) and response.get('status') == 'success'):
             return response
-        elif hasattr(response, 'status_code') and response.status_code == 429:
-            print(f"    Token #{current_token_index + 1} hit rate limit, rotating...")
-            rotate_token()
-            continue
+        elif response is None:
+            print(f"    Request failed for {url} - no response")
+            return None
         else:
-            print(f"    Request failed for {url}")
+            print(f"    Request failed for {url} - invalid response")
             return None
 
     print(f"    All tokens exhausted for {url}")
